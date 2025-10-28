@@ -1,33 +1,55 @@
-# app/repos.py
-import os
-import shutil
-import tempfile
-from git import Repo, GitCommandError
+class User(BaseModel):
+id: int
+username: str
 
-WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/tmp/repos")
 
-def safe_repo_dir_name(repo_url: str) -> str:
-    # Basic safe name extraction
-    name = repo_url.rstrip("/").split("/")[-1]
-    if name.endswith(".git"):
-        name = name[:-4]
-    return name.replace(" ", "_")
+async def get_current_user() -> User:
+# Replace this with your real authentication/dependency
+return User(id=1, username="testuser")
 
-def clone_repo(repo_url: str, branch: str = None) -> dict:
-    """
-    Clone repository into workspace and return metadata.
-    """
-    os.makedirs(WORKSPACE_DIR, exist_ok=True)
-    repo_name = safe_repo_dir_name(repo_url)
-    target_dir = os.path.join(WORKSPACE_DIR, repo_name)
-    # If exists, remove or use unique temp
-    if os.path.exists(target_dir):
-        # create a timestamped directory
-        target_dir = os.path.join(WORKSPACE_DIR, f"{repo_name}_{int(os.times().system)}")
-    try:
-        repo = Repo.clone_from(repo_url, target_dir)
-        if branch:
-            repo.git.checkout(branch)
-        return {"status": "ok", "repo_name": repo_name, "path": target_dir}
-    except GitCommandError as e:
-        return {"status": "error", "error": str(e)}
+
+# --- Utility functions ---
+
+
+def _is_zip_file_bytes(data: bytes) -> bool:
+"""Check whether the given bytes represent a valid ZIP archive by trying to open it."""
+try:
+with tempfile.NamedTemporaryFile(delete=False) as tmp:
+tmp.write(data)
+tmp.flush()
+tmp_path = tmp.name
+with zipfile.ZipFile(tmp_path, 'r') as zf:
+# try a quick read of namelist to validate the archive structure
+_ = zf.namelist()
+return True
+except zipfile.BadZipFile:
+return False
+finally:
+try:
+os.remove(tmp_path)
+except Exception:
+pass
+
+
+
+
+async def _clone_repo_async(git_url: str, dest_dir: Optional[str] = None, timeout: int = 60) -> str:
+"""
+Clone the repository into a temporary directory using subprocess in a thread so it doesn't block the event loop.
+Returns the path to cloned repository on success, raises an exception on failure.
+"""
+if dest_dir is None:
+dest_dir = tempfile.mkdtemp(prefix="repo_clone_")
+
+
+# Use git clone --depth 1 to reduce data transferred and time
+cmd = ["git", "clone", "--depth", "1", git_url, dest_dir]
+
+
+try:
+# run in a thread so FastAPI's event loop isn't blocked
+proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=timeout)
+if proc.returncode != 0:
+# include stderr for debugging
+raise RuntimeError(f"git clone failed: {proc.stderr.strip()}")
+}
