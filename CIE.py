@@ -1,217 +1,259 @@
-# file: services/file_processing.py
+"""
+repo_intel_with_system_user_state.py
 
+- Uses a robust SYSTEM prompt + USER prompt pattern for LLM calls.
+- Maintains per-repo analysis state in a JSON file.
+- Uses PGVector retriever, DuckDuckGo for lightweight web context,
+  and ChatOpenAI for the LLM.
+"""
+
+import json
+import logging
 import os
-import uuid
-import subprocess
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from rank_bm25 import BM25Okapi
-from langchain.document_loaders import DirectoryLoader, NotebookLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
+import time
+from typing import Any, Dict, List, Optional
+
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# LangChain imports (match your environment; adjust if module paths differ)
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_postgres import PGVector
-from langchain.schema import Document
-from utils import clean_and_tokenize
+from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain_community.tools import DuckDuckGoSearchResults
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
-# ------------------------------------------------------
-# 1️⃣ Clone GitHub repository
-# ------------------------------------------------------
-def clone_github_repo(github_url, base_path="./repos"):
-    try:
-        repo_id = str(uuid.uuid4())
-        local_path = os.path.join(base_path, repo_id)
-        os.makedirs(local_path, exist_ok=True)
+# -------------------------
+# Conversation / analysis state store
+# -------------------------
+class RepoStateStore:
+    """A lightweight JSON-backed store to persist repo analyses and conversation history."""
 
-        subprocess.run(['git', 'clone', github_url, local_path], check=True)
-        print(f"✅ Repository cloned at {local_path}")
-        return repo_id, local_path
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Failed to clone repository: {e}")
-        return None, None
+    def __init__(self, path: str = "repo_analyses.json"):
+        self.path = path
+        self._data: Dict[str, Any] = {"repos": {}}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self._data = json.load(f)
+            except Exception as e:
+                logger.warning("Failed to load state file '%s': %s. Starting fresh.", self.path, e)
+                self._data = {"repos": {}}
+
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, indent=2)
+        os.replace(tmp, self.path)
+
+    def get_repo(self, repo_id: str) -> Dict[str, Any]:
+        return self._data["repos"].get(repo_id, {})
+
+    def upsert_repo(self, repo_id: str, payload: Dict[str, Any]):
+        now = time.time()
+        entry = self._data["repos"].get(repo_id, {"created_at": now, "runs": []})
+        entry["updated_at"] = now
+        # append run metadata
+        run = {"timestamp": now, "payload": payload}
+        entry.setdefault("runs", []).append(run)
+        # store summary top-level convenience field
+        entry["last_summary"] = payload.get("summary") or payload
+        self._data["repos"][repo_id] = entry
+        self._save()
 
 
-# ------------------------------------------------------
-# 2️⃣ Load, split, and store documents (into pgvector)
-# ------------------------------------------------------
-def load_and_index_files(repo_id, repo_path, postgres_url):
-    extensions = [
-        'txt', 'md', 'markdown', 'rst', 'py', 'js', 'java', 'c', 'cpp', 'cs', 'go', 'rb',
-        'php', 'scala', 'html', 'htm', 'xml', 'json', 'yaml', 'yml', 'ini', 'toml',
-        'cfg', 'conf', 'sh', 'bash', 'css', 'scss', 'sql', 'gitignore', 'dockerignore',
-        'editorconfig', 'ipynb'
-    ]
+# -------------------------
+# Default sophisticated system prompt
+# -------------------------
+DEFAULT_SYSTEM_PROMPT = (
+    "You are RepoIntelGPT — an expert system for analyzing code repositories, their structure, "
+    "entry points, dependencies and frameworks. Follow these instructions strictly:\n"
+    "1) Output a valid JSON object (no surrounding markdown) with keys: "
+    "repo_type, structure, important_files, entry_point, dependencies, framework, summary.\n"
+    "2) Keep 'summary' to 2-4 sentences. Other fields can be arrays/strings as appropriate.\n"
+    "3) If something is ambiguous or missing from the provided context, include an 'assumptions' key "
+    "listing them.\n"
+    "4) If you provide file paths or commands, ensure they are relative to repository root and platform-agnostic.\n"
+    "5) If multiple valid options exist, provide them as an array with short pros/cons.\n"
+    "6) Avoid hallucinating filenames or dependencies — indicate when information is not present in context.\n"
+)
 
-    file_type_counts = {}
-    documents_dict = {}
 
-    for ext in extensions:
-        glob_pattern = f'**/*.{ext}'
+# -------------------------
+# LLM wrapper with retries
+# -------------------------
+class LLMInvoker:
+    def __init__(self, model: str = "gpt-4o-mini", temperature: float = 0.2):
+        # ChatOpenAI wrapper from langchain
+        self.llm = ChatOpenAI(model=model, temperature=temperature)
+
+    @retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3),
+           retry=retry_if_exception_type(Exception))
+    def call_with_system_user(self, system_prompt: str, user_prompt: str, max_tokens: int = 1024) -> str:
+        """
+        Build a chat prompt with explicit system & user messages then call the ChatOpenAI LLM.
+        Returns assistant text.
+        """
+        system_t = SystemMessagePromptTemplate.from_template(system_prompt)
+        user_t = HumanMessagePromptTemplate.from_template(user_prompt)
+        prompt = ChatPromptTemplate.from_messages([system_t, user_t])
+
+        # Format messages -> depending on LangChain version, you may call format_messages
+        messages = prompt.format_messages({})
+        # ChatOpenAI expects either prompt or messages; using messages directly is safer across versions.
+        # Some ChatOpenAI clients accept messages param or .generate(messages=...). We'll attempt .generate() if available.
         try:
-            if ext == 'ipynb':
-                loader = NotebookLoader(
-                    str(repo_path),
-                    include_outputs=True,
-                    max_output_length=20,
-                    remove_newline=True
-                )
+            # .generate returns object with generations -> get text
+            result = self.llm.generate(messages)
+            # extract text from result (LangChain shapes vary; we try a few fallbacks)
+            if hasattr(result, "generations"):
+                gen = result.generations[0][0]
+                assistant_text = gen.text
             else:
-                loader = DirectoryLoader(repo_path, glob=glob_pattern)
+                assistant_text = str(result)
+        except Exception:
+            # fallback: call .predict with joined templates (less structured but works)
+            joined = "\n\n".join([system_prompt, user_prompt])
+            assistant_text = self.llm.predict(joined, max_tokens=max_tokens)
 
-            loaded_documents = loader.load() if callable(loader.load) else []
-            if loaded_documents:
-                file_type_counts[ext] = len(loaded_documents)
-                for doc in loaded_documents:
-                    file_path = doc.metadata['source']
-                    relative_path = os.path.relpath(file_path, repo_path)
-                    file_id = str(uuid.uuid4())
-                    doc.metadata.update({
-                        "source": relative_path,
-                        "file_id": file_id,
-                        "repo_id": repo_id,
-                        "repo_path": repo_path,
-                        "extension": ext,
-                    })
-                    documents_dict[file_id] = doc
-        except Exception as e:
-            print(f"⚠️ Error loading files with pattern '{glob_pattern}': {e}")
-            continue
-
-    # --- Split into smaller chunks ---
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200)
-    split_documents = []
-    for file_id, original_doc in documents_dict.items():
-        chunks = text_splitter.split_documents([original_doc])
-        for c in chunks:
-            c.metadata.update(original_doc.metadata)
-        split_documents.extend(chunks)
-
-    # --- Store in pgvector for semantic search ---
-    if split_documents:
-        print(f"🧠 Storing {len(split_documents)} chunks for repo {repo_id} in pgvector...")
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        vector_store = PGVector.from_documents(
-            documents=split_documents,
-            embedding=embeddings,
-            connection_string=postgres_url,
-            collection_name=f"repo_{repo_id}",
-            use_jsonb=True
-        )
-
-    # --- Create BM25 + TF-IDF hybrid index (in memory) ---
-    tokenized_docs = [clean_and_tokenize(doc.page_content) for doc in split_documents]
-    index = BM25Okapi(tokenized_docs)
-
-    return {
-        "repo_id": repo_id,
-        "index": index,
-        "documents": split_documents,
-        "file_type_counts": file_type_counts,
-        "sources": [doc.metadata["source"] for doc in split_documents]
-    }
+        assistant_text = assistant_text.strip()
+        return assistant_text
 
 
-# ------------------------------------------------------
-# 3️⃣ Search within a specific repo (hybrid + vector)
-# ------------------------------------------------------
-def search_documents(query, repo_id, postgres_url, bm25_index, documents, n_results=5):
-    query_tokens = clean_and_tokenize(query)
-    bm25_scores = bm25_index.get_scores(query_tokens)
+# -------------------------
+# Main repo intelligence function
+# -------------------------
+def see_repository_intelligence(
+    repo_id: str,
+    postgres_url: str,
+    collection_name: str,
+    *,
+    user_query: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    state_store_path: str = "repo_analyses.json",
+    retriever_k: int = 8,
+) -> Dict[str, Any]:
+    """
+    Retrieve stored repo chunks from pgvector, optionally augment with web search,
+    and use a system+user prompt LLM call to build structured repo intelligence.
+    """
 
-    # --- TF-IDF cosine similarity ---
-    tfidf_vectorizer = TfidfVectorizer(
-        tokenizer=clean_and_tokenize,
-        lowercase=True,
-        stop_words='english',
-        use_idf=True,
-        smooth_idf=True,
-        sublinear_tf=True
-    )
+    system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+    user_query = user_query or "Analyze the repository and detect its type, entry points, dependencies, and framework."
 
-    tfidf_matrix = tfidf_vectorizer.fit_transform([doc.page_content for doc in documents])
-    query_tfidf = tfidf_vectorizer.transform([query])
-    cosine_sim_scores = cosine_similarity(query_tfidf, tfidf_matrix).flatten()
+    # 1) load previous state
+    store = RepoStateStore(path=state_store_path)
+    prev = store.get_repo(repo_id)
+    logger.info("Loaded previous state for repo %s: %s", repo_id, "found" if prev else "none")
 
-    # --- Combine BM25 + TF-IDF ---
-    combined_scores = bm25_scores * 0.5 + cosine_sim_scores * 0.5
-    top_indices = combined_scores.argsort()[::-1][:n_results]
-    local_results = [documents[i] for i in top_indices]
-
-    # --- Also retrieve from pgvector for deep semantic matches ---
+    # 2) Connect to vector store and retriever
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
     vector_store = PGVector(
         connection_string=postgres_url,
-        collection_name=f"repo_{repo_id}",
+        collection_name=collection_name,
         embedding_function=embeddings,
-        use_jsonb=True
+        use_jsonb=True,
     )
-    vector_results = vector_store.similarity_search(query, k=5)
+    retriever = vector_store.as_retriever(search_kwargs={"k": retriever_k})
 
-    # --- Combine hybrid + vector results ---
-    all_results = {r.metadata["source"]: r for r in local_results + vector_results}
-    final = list(all_results.values())[:n_results]
+    # 3) Fetch relevant repo docs (safely handle if none present)
+    try:
+        retrieved_docs = retriever.get_relevant_documents(user_query)
+    except Exception as e:
+        logger.exception("Failed to retrieve documents from pgvector: %s", e)
+        retrieved_docs = []
 
-    return final
-# file: services/file_processing.py
+    context_pieces: List[str] = []
+    for d in retrieved_docs:
+        # Each doc may be a dict-like object, ensure page_content exists.
+        text = getattr(d, "page_content", None) or d.get("page_content") if isinstance(d, dict) else None
+        if text:
+            # Keep some light trimming to avoid over-long prompts
+            context_pieces.append(text[:4000])
 
-def main():
-    """
-    Demonstrates full repository flow:
-    1. Clone GitHub repository
-    2. Index and store chunks in pgvector
-    3. Perform hybrid + semantic search within that repo
-    """
+    context = "\n\n---\n\n".join(context_pieces) if context_pieces else "NO_LOCAL_CONTEXT_FOUND"
 
-    # --- 🧩 Step 1: Config ---
-    GITHUB_URL = "https://github.com/tiangolo/fastapi.git"  # you can replace this
-    POSTGRES_URL = "postgresql+psycopg://postgres:password@localhost:5432/vector_db"
+    # 4) Get web augmentation
+    try:
+        web_search = DuckDuckGoSearchResults()
+        web_results = web_search.run(f"{user_query} repository type and framework details")
+        # compact web info to a string
+        web_info = "\n".join([r.get("snippet") or str(r) for r in (web_results or [])])[:4000]
+    except Exception as e:
+        logger.info("Web search failed or not available: %s", e)
+        web_info = "NO_WEB_RESULTS"
 
-    print("🚀 Starting repository processing pipeline...\n")
-
-    # --- 🌀 Step 2: Clone the repository ---
-    repo_id, repo_path = clone_github_repo(GITHUB_URL)
-    if not repo_id:
-        print("❌ Repository cloning failed. Exiting.")
-        return
-
-    print(f"✅ Repo cloned successfully.\nRepo ID: {repo_id}\nRepo Path: {repo_path}\n")
-
-    # --- 🧠 Step 3: Index and push to pgvector ---
-    repo_data = load_and_index_files(
-        repo_id=repo_id,
-        repo_path=repo_path,
-        postgres_url=POSTGRES_URL
-    )
-
-    print(f"📊 Indexed {len(repo_data['documents'])} chunks from {len(repo_data['file_type_counts'])} file types.")
-    print(f"🧠 Data pushed to pgvector under collection: repo_{repo_id}")
-
-    # --- 🔍 Step 4: Search query ---
-    print("\n🔍 Performing sample search...")
-    query = "authentication middleware"
-    results = search_documents(
-        query=query,
-        repo_id=repo_id,
-        postgres_url=POSTGRES_URL,
-        bm25_index=repo_data["index"],
-        documents=repo_data["documents"],
-        n_results=5
+    # 5) Compose the user prompt combining the dynamic pieces
+    composed_user_prompt = (
+        f"Repository ID: {repo_id}\n\n"
+        f"Local Context (from pgvector retriever):\n{context}\n\n"
+        f"Web Augmentation:\n{web_info}\n\n"
+        f"User Task:\n{user_query}\n\n"
+        "Produce a strict JSON object with the keys described in the system prompt. "
+        "If something is missing in the context, say so under the 'assumptions' key."
     )
 
-    # --- 📜 Step 5: Display results ---
-    print(f"\n💬 Query: {query}")
-    print(f"📂 Found {len(results)} relevant code/document sections:\n")
+    # 6) Call LLM with system + user prompt
+    llm_invoker = LLMInvoker()
+    try:
+        assistant_text = llm_invoker.call_with_system_user(system_prompt=system_prompt, user_prompt=composed_user_prompt)
+    except Exception as e:
+        logger.exception("LLM invocation failed: %s", e)
+        assistant_text = json.dumps({"error": "LLM invocation failed", "detail": str(e)})
 
-    for i, doc in enumerate(results, start=1):
-        meta = doc.metadata
-        print(f"🔹 {i}. {meta.get('source', 'unknown file')}")
-        print(f"   📄 File ID: {meta.get('file_id')}")
-        print(f"   📁 Repo ID: {meta.get('repo_id')}")
-        print(f"   ✏️  Snippet:\n{doc.page_content[:300]}...\n")
+    # 7) Try to parse assistant output as JSON (some LLMs might include explanation — we try to extract JSON)
+    structured_output: Dict[str, Any] = {}
+    assistant_text_stripped = assistant_text.strip()
+    # attempt direct JSON parse
+    try:
+        structured_output = json.loads(assistant_text_stripped)
+    except Exception:
+        # attempt to find first JSON object inside text
+        import re
 
-    print("✅ Search completed successfully.")
+        match = re.search(r"(\{(?:.|\n)*\})", assistant_text_stripped)
+        if match:
+            try:
+                structured_output = json.loads(match.group(1))
+            except Exception:
+                logger.warning("Failed to parse JSON inside LLM output; returning raw assistant text.")
+                structured_output = {"summary": assistant_text_stripped}
+        else:
+            structured_output = {"summary": assistant_text_stripped}
+
+    # enrich with meta
+    structured_output.setdefault("repo_id", repo_id)
+    structured_output.setdefault("collection_name", collection_name)
+    # store run metadata into persistent state
+    run_payload = {
+        "user_query": user_query,
+        "system_prompt_used": system_prompt[:2000],
+        "assistant_raw": assistant_text_stripped[:16000],
+        "result": structured_output,
+    }
+    store.upsert_repo(repo_id, run_payload)
+
+    return structured_output
 
 
-# Entry point
+# -------------------------
+# Quick demo when executed directly
+# -------------------------
 if __name__ == "__main__":
-    main()
+    # Replace with your real connection string and collection name
+    postgres_url = os.getenv("POSTGRES_URL", "postgresql+psycopg://postgres:password@localhost:5432/vector_db")
+    collection_name = os.getenv("COLLECTION_NAME", "repo_a1b2c3d4")
+    repo_id = "a1b2c3d4"
+
+    result = see_repository_intelligence(
+        repo_id=repo_id,
+        postgres_url=postgres_url,
+        collection_name=collection_name,
+        user_query="Analyze the repository and list its entry points, main dependencies and frameworks used."
+    )
+    print(json.dumps(result, indent=2))
