@@ -1,103 +1,114 @@
-import json
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+# file: services/repo_analyzer.py
+
+import os
+import uuid
+from langchain_community.document_loaders import GitLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
 from langchain_postgres import PGVector
-from langchain.prompts import ChatPromptTemplate
-from langchain_community.tools import DuckDuckGoSearchResults
-from langchain_core.runnables import RunnablePassthrough
+from langchain.schema import Document
 
 
-def see_repository_intelligence(
-    repo_id: str,
+def clone_chunk_store_repo(
+    github_url: str,
     postgres_url: str,
-    collection_name: str,
-    query: str = "Analyze the repository and detect its type, entry points, dependencies, and framework.",
+    local_base: str = "./repos",
+    branch: str = "main",
+    collection_name: str | None = None,
 ):
     """
-    Retrieve stored repo chunks from pgvector, analyze using LLM + web search,
-    and return structured repository intelligence.
+    Clone a GitHub repo, chunk its files, enrich metadata, and store them in a pgvector DB.
 
     Args:
-        repo_id (str): ID of the repository stored.
-        postgres_url (str): PostgreSQL + pgvector connection string.
-        collection_name (str): Vector collection name for this repo.
-        query (str): Query for the analysis (default: full repo understanding).
+        github_url (str): Repository URL.
+        postgres_url (str): PostgreSQL connection string with pgvector enabled.
+                            Example: "postgresql+psycopg://user:password@localhost:5432/mydb"
+        local_base (str): Directory to store cloned repos.
+        branch (str): Branch name to clone.
+        collection_name (str | None): Optional custom name for the vector collection.
 
     Returns:
-        dict: Structured analysis summary.
+        dict: summary of operation with repo_path and number of chunks stored.
     """
 
-    # --- 1️⃣ Connect to vector store ---
+    # ------------------ STEP 1: CLONE REPO ------------------
+    os.makedirs(local_base, exist_ok=True)
+    repo_id = uuid.uuid4().hex[:8]
+    repo_path = os.path.join(local_base, repo_id)
+
+    loader = GitLoader(
+        clone_url=github_url,
+        repo_path=repo_path,
+        branch=branch,
+    )
+    print(f"🌀 Cloning repo from {github_url} ...")
+    raw_docs = loader.load()
+    print(f"✅ Repo cloned: {len(raw_docs)} files loaded")
+
+    # ------------------ STEP 2: CHUNK FILES ------------------
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", " ", ""],
+    )
+    chunked_docs = splitter.split_documents(raw_docs)
+
+    for doc in chunked_docs:
+        source_path = doc.metadata.get("source", "")
+        file_ext = os.path.splitext(source_path)[1]
+        doc.metadata.update({
+            "repo_id": repo_id,
+            "repo_url": github_url,
+            "repo_path": repo_path,
+            "branch": branch,
+            "filename": os.path.basename(source_path),
+            "file_directory": os.path.dirname(source_path),
+            "file_extension": file_ext,
+            "chunk_length": len(doc.page_content),
+        })
+
+    print(f"🧩 Chunking complete: {len(chunked_docs)} chunks created")
+
+    # ------------------ STEP 3: STORE IN PGVECTOR ------------------
+    collection = collection_name or f"repo_{repo_id}"
+
+    print(f"💾 Connecting to PostgreSQL vector store: {collection}")
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    vector_store = PGVector(
+    vector_store = PGVector.from_documents(
+        documents=chunked_docs,
+        embedding=embeddings,
         connection_string=postgres_url,
-        collection_name=collection_name,
-        embedding_function=embeddings,
-        use_jsonb=True,
+        collection_name=collection,
+        use_jsonb=True,  # metadata stored in JSONB
     )
+print(f"💾 Storing chunks in batches of {batch_size} ...")
+    total = len(chunked_docs)
+    for i in range(0, total, batch_size):
+        batch = chunked_docs[i:i + batch_size]
+        try:
+            vector_store.add_documents(batch)
+            print(f"✅ Stored batch {i // batch_size + 1} ({i + len(batch)} / {total})")
+        except Exception as e:
+            print(f"⚠️ Error storing batch {i // batch_size + 1}: {e}")
+            time.sleep(2)  # small delay for rate limits
 
-    retriever = vector_store.as_retriever(search_kwargs={"k": 8})
+    print(f"🎉 Done! {total} chunks stored in collection '{collection}'")
 
-    # --- 2️⃣ Prepare web search + LLM ---
-    web_search = DuckDuckGoSearchResults()
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 
-    # --- 3️⃣ Get context + web info ---
-    retrieved_docs = retriever.get_relevant_documents(query)
-    context = "\n".join([doc.page_content for doc in retrieved_docs])
-    web_results = web_search.run(f"{query} repository type and framework details")
+    print(f"✅ Stored {len(chunked_docs)} chunks in collection '{collection}'")
 
-    # --- 4️⃣ Modern LCEL-style prompt ---
-    prompt = ChatPromptTemplate.from_template(
-        """You are a repository intelligence system.
-        Using the following repository context and web info, analyze the codebase.
-
-        Context:
-        {context}
-
-        Web Info:
-        {web}
-
-        Task:
-        {query}
-
-        Return your answer in JSON with keys:
-        repo_type, structure, important_files, entry_point, dependencies, framework, summary.
-        """
-    )
-
-    # --- 5️⃣ Build LCEL chain (retriever + prompt + LLM) ---
-    chain = (
-        {
-            "context": lambda _: context,  # static repo context
-            "query": RunnablePassthrough(),
-            "web": lambda _: web_results,  # static web info
-        }
-        | prompt
-        | llm
-    )
-
-    # --- 6️⃣ Run the chain ---
-    response = chain.invoke(query)
-
-    # --- 7️⃣ Parse JSON output ---
-    try:
-        structured_output = json.loads(response.content)
-    except Exception:
-        structured_output = {"summary": response.content}
-
-    structured_output["repo_id"] = repo_id
-    structured_output["collection_name"] = collection_name
-
-    return structured_output
-
+    # ------------------ STEP 4: RETURN SUMMARY ------------------
+    return {
+        "repo_id": repo_id,
+        "repo_path": repo_path,
+        "collection_name": collection,
+        "chunks_stored": len(chunked_docs),
+    }
 
 if __name__ == "__main__":
+    github_url = "https://github.com/openai/openai-cookbook"
     postgres_url = "postgresql+psycopg://postgres:password@localhost:5432/vector_db"
 
-    result = see_repository_intelligence(
-        repo_id="a1b2c3d4",
-        postgres_url=postgres_url,
-        collection_name="repo_a1b2c3d4"
-    )
-
-    print(json.dumps(result, indent=2))
+    summary = clone_chunk_store_repo(github_url, postgres_url)
+    print("\n--- Summary ---")
+    print(summary)
